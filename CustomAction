@@ -1,0 +1,188 @@
+using System;
+using System.Activities;
+using System.Linq;
+using Microsoft.Xrm.Sdk;
+using Microsoft.Xrm.Sdk.Messages;
+using Microsoft.Xrm.Sdk.Metadata;
+using Microsoft.Xrm.Sdk.Query;
+using Microsoft.Xrm.Sdk.Workflow;
+using Newtonsoft.Json.Linq;
+namespace Demo1
+{
+    public class Class1 : CodeActivity
+    {
+        [Input("RequestJson")]
+        public InArgument<string> RequestJson { get; set; }
+
+
+        [Output("ResponseJson")]
+        public OutArgument<string> ResponseJson { get; set; }
+
+        protected override void Execute(CodeActivityContext context)
+        {
+            IWorkflowContext workflowContext = context.GetExtension<IWorkflowContext>();
+            IOrganizationService service = context.GetExtension<IOrganizationServiceFactory>().CreateOrganizationService(null);
+            ITracingService tracingService = context.GetExtension<ITracingService>();
+            try
+            {
+                // Get the input parameters
+                string requestJson = RequestJson.Get(context);
+
+                tracingService.Trace("Request JSON CodeActivity " + requestJson);
+                // Parse the JSON object
+
+                JObject requestObject = JObject.Parse(requestJson);
+                tracingService.Trace("Parse JSON Object " + requestJson);
+                // Extract the values from the JSON object
+
+                string caseTitle = (string)requestObject["CaseTitle"];
+                //string caseNo = (string)requestObject["CaseNo"];
+                string description = (string)requestObject["Description"];
+                string customerEmail = (string)requestObject["Customer"];
+                string caseCategory = (string)requestObject["CaseCategory"];
+                string caseSubCategory = (string)requestObject["CaseSubCategory"];
+                string AdditionalDetails = (string)requestObject["AdditionalDetails"];
+                tracingService.Trace("Extract the values from the JSON object");
+                tracingService.Trace("Extract the values from the JSON object" + AdditionalDetails);
+                // Check if the case already exists in CRM
+
+                Guid caseId = RetrieveCaseFields(customerEmail, caseCategory, context);
+
+                    tracingService.Trace("caseId" + caseId);
+                    Entity caseRecord = new Entity("incident");
+                    if (caseId != Guid.Empty)
+                    {
+                        tracingService.Trace("if block");
+                        // Case already exists, update the existing record
+                        caseRecord.Id = caseId;
+                        tracingService.Trace("if block2");
+                    }
+                    // Set the case record fields
+                    caseRecord["title"] = caseTitle;
+                    //caseRecord["ticketnumber"] = caseNo;
+                    caseRecord["description"] = description;
+                    Guid contactId = FindContactByEmail(customerEmail, context);
+                    caseRecord["customerid"] = new EntityReference("contact", contactId);                   
+
+                    int OptionSetValue_CaseCategory = GetOptionSetValue(service, tracingService, caseCategory, "new_casecategory");
+                    caseRecord.Attributes["new_casecategory"] = new OptionSetValue(OptionSetValue_CaseCategory);
+                    tracingService.Trace("test optionset");            
+                    
+                    caseRecord["new_casesubcategory"] = caseSubCategory;
+                    tracingService.Trace("set the fields");
+                    // Save the case record in CRM
+                    if (caseId != Guid.Empty)
+                    {
+                        // Case already exists, update the existing record
+                        service.Update(caseRecord);
+                    }
+                    else
+                    {
+                        // Case does not exist, create a new record
+                        caseId = service.Create(caseRecord);
+                        Entity TaskRecord = new Entity("task");
+                        TaskRecord.Attributes["regardingobjectid"] = new EntityReference("incident", new Guid(caseId.ToString()));
+                        TaskRecord.Attributes["subject"] = AdditionalDetails;
+                        service.Create(TaskRecord);
+                        tracingService.Trace("Just created task !!! ");
+                    }
+                    Entity rec = service.Retrieve("incident", caseId, new ColumnSet(true));
+                    string CaseNumber = rec.Attributes["ticketnumber"].ToString();
+                    // Construct the success response JSON object
+                    JObject responseObject = new JObject();
+                    responseObject["Status"] = "Success";
+                    responseObject["Message"] = "Incident has been created/updated successfully";
+                    responseObject["CaseId"] = CaseNumber;
+
+                    // Set the output parameters
+                    ResponseJson.Set(context, responseObject.ToString());
+                }
+                catch (Exception ex)
+                {
+                    // Construct the failure response JSON object
+                    JObject responseObject = new JObject();
+                    responseObject["Status"] = "Failed";
+                    responseObject["Message"] = ex.Message;
+                    responseObject["CaseId"] = null;
+
+                    // Set the output parameters
+                    ResponseJson.Set(context, responseObject.ToString());
+                }
+            }
+         private Guid RetrieveCaseFields(string customerEmail, string caseCategory, CodeActivityContext context)
+            {
+                var service = context.GetExtension<IOrganizationServiceFactory>().CreateOrganizationService(null);
+                ITracingService tracingService = context.GetExtension<ITracingService>();
+                QueryExpression query = new QueryExpression("incident");
+                query.ColumnSet = new ColumnSet("incidentid", "customerid", "new_casecategory", "ticketnumber");
+                //query.Criteria.AddCondition("title", ConditionOperator.Equal, caseTitle);
+                query.Criteria.AddCondition("customerid", ConditionOperator.Equal, new EntityReference("contact", FindContactByEmail(customerEmail, context)).Id);
+                tracingService.Trace("customerEmail" + customerEmail);
+
+                var caseCategoryCondition = new ConditionExpression("new_casecategory", ConditionOperator.Equal, GetOptionSetValue(service, tracingService, caseCategory, "new_casecategory"));
+                query.Criteria.AddCondition(caseCategoryCondition);
+
+                EntityCollection results = service.RetrieveMultiple(query);
+                tracingService.Trace("Number of matching cases: " + results.Entities.Count);
+
+                if (results.Entities.Count > 0)
+                {
+                    return results.Entities[0].Id;
+                }
+                else
+                {
+                    return Guid.Empty;
+                }
+            }
+
+            private Guid FindContactByEmail(string email, CodeActivityContext context)
+            {
+                var service = context.GetExtension<IOrganizationServiceFactory>().CreateOrganizationService(null);
+                var query = new QueryExpression("contact");
+                query.ColumnSet = new ColumnSet("contactid");
+                query.Criteria.AddCondition("emailaddress1", ConditionOperator.Equal, email);
+                var result = service.RetrieveMultiple(query);
+
+                if (result.Entities.Count > 0)
+                {
+                    return result.Entities[0].Id;
+                }
+                else
+                {
+                    throw new InvalidPluginExecutionException("Contact not found for the given email address.");
+                }
+            }
+            private int GetOptionSetValue(IOrganizationService orgService, ITracingService tracing, string caseCategory, string fieldLogicalName)
+            {
+                string optionsetText = caseCategory;
+                var attributeRequest = new RetrieveAttributeRequest()
+                {
+                    EntityLogicalName = "incident",
+                    LogicalName = fieldLogicalName,
+                    RetrieveAsIfPublished = true
+                };
+                // Execute the request.
+                var attributeResponse = (RetrieveAttributeResponse)orgService.Execute(attributeRequest);
+         
+                // Access the retrieved attribute.
+                var picklistAttributeMetadata = (PicklistAttributeMetadata)attributeResponse.AttributeMetadata;
+
+                // Get the current options list for the retrieved attribute.
+                OptionSetMetadata optionsetMetadata = picklistAttributeMetadata.OptionSet;
+
+                var option = optionsetMetadata.Options.FirstOrDefault(o => o.Label.UserLocalizedLabel.Label.ToLower() == optionsetText.ToLower());
+
+                if (option != null)
+                {
+                    return option.Value.Value;
+                }
+
+                tracing.Trace("Option for caseCategory not found: " + caseCategory);
+                return 0; // Default value if option not found
+            }
+
+
+
+        }
+    }
+    
